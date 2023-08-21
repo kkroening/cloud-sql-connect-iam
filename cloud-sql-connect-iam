@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+#
+# `cloud-sql-connect-iam`: Connect to Google Cloud SQL securely with IAM auth.
+#
+# See `_show_usage` for detailed usage explanation.
+#
+# Code style mostly follows [Google's Shell Style Guide]
+# (https://google.github.io/styleguide/shellguide.html) with some minor
+# differences:
+#
+# -   Strive to mimic idiomatic Python where possible.
+# -   Avoid `exit` and prefer `return`, which behaves more like Python's `raise`
+#     when used properly.
+# -   Prefer functions to be single-output, mimicking Python single-return
+#     convention, where stdout behaves somewhat like Python's `return`.
+#     However, some bash functions are more like Python generators, in which
+#     case stdout is more like `yield`.
+# -   All-caps are typically global, aside from exporting environment variables
+#     to child processes.
+# -   Underscore-prefixed names indicate private - defined and used only
+#     within this file.  Non-underscore-prefixed globals typically may be passed
+#     in via environment.
+# -   Prefer globals to be immutable, with an exception being arg parsing, which
+#     may perform initial assignment and then being immutable.  (Unfortunately
+#     it's impractical to return dict-like result from an arg parsing function;
+#     see https://cjungmann.github.io/yaddemo/docs/bashreturnarray.html)
+# -   Put docstrings *inside* functions - not outside, and avoid noisy banner-
+#     style comments.
+# -   Pretend docstrings/comments are Markdown; use [Google's style]
+#     (https://github.com/google/styleguide/blob/gh-pages/docguide/style.md).
+# -   Assign function input arguments to clearly named local variables at the
+#     very beginning of the function (after the docstring, if there is one)
+#     rather than using e.g. `"$1"` throughout the function.
+# -   Use `|| return` everywhere in functions because [bash is terrible]
+#     (https://stackoverflow.com/questions/4072984).
+#
+set -euo pipefail
+
+: ${CONNECTION_NAME:=}
+: ${DEBUG:=}
+: ${GCP_PROJECT:=}
+: ${GCP_REGION:=}
+: ${INSTANCE_NAME:=}
+: ${MYSQL_COMMAND:=mysql}
+: ${PROXY_COMMAND:=cloud-sql-proxy}
+: ${PROXY_SOCKET_DIR:=/tmp}
+: ${PROXY_TIMEOUT:=3}
+_MYSQL_ARGS=()
+_PASSWORD_LOGIN=0
+
+function _show_usage() {
+  cat << EOF
+$(basename "$0"): Connect to Google Cloud SQL securely with IAM auth.
+
+Usage:
+  $(basename "$0") <instance_name|connection_name> [--] [mysql_arguments...]
+
+Description:
+  Connects to a Cloud SQL database instance over cloud-sql-proxy using a unix
+  domain socket, with suppport for IAM-based authentication
+
+  Only MySQL is currently supported.
+
+  This tool addresses some of the limitations of the official \`gcloud sql
+  connect\`: IAM authentication, unix-domain sockets, and accepting additional
+  \`mysql\` command arguments.  The primary focus is to simplify automation of
+  Cloud SQL provisioning for deployment from GitHub Actions with Terraform and
+  workload identity federation, but it can also be used from a system
+  administration standpoint to quickly, conveniently, and securely connect to a
+  Cloud SQL instance without requiring use of shared secrets (username/
+  password), and instead leveraging Google Cloud's IAM.
+
+  Use of Cloud SQL IAM authentication requires care from a security standpoint
+  because cloud-sql-proxy and gcloud-sql-connect use TCP sockets by default,
+  which creates a local port that provides direct SQL access with only a
+  username - i.e. unacceptable.  Instead, unix-domain sockets are far more
+  secure because they can be locked down with 0700 file system permissions.
+  Unfortunately, gcloud-sql-connect doesn't support unix-domain sockets (yet?),
+  and cloud-sql-proxy requires painstaking management of temp directories to
+  avoid collision with concurrently running proxies.  This tool eliminates the
+  hassle by automatically running the proxy in the background with a unique
+  tmpdir, and cleaning up upon exiting.
+
+  IAM authentication is not strictly required; although it's ideal in many
+  cases, there are certain cases where you can't avoid the need for password-
+  based login.  In particular, creating the first IAM user for a Cloud SQL
+  instance requires use of a built-in (password-based) user to bootstrap the
+  IAM user's permissions.  By default, gcloud application-default credentials
+  are used for IAM auth, but \`--password\` or \`--password=...\` can be
+  passed to use password-based login instead.
+
+Positional arguments:
+  <instance_name|connection_name>
+        The name of the Google Cloud SQL instance or full connection name.
+  [--]
+        If specified, pass all subsequent arguments directly to MySQL.
+  [mysql_arguments...]
+        Any additional arguments passed directly to the MySQL client.
+
+Keyword arguments:
+  --help
+        Show help.
+  --mysql-command=mysql 
+        Path to the mysql command.
+  --password[=...]
+        Use password-based login instead of IAM auth.
+  --project=...
+        Google Cloud project name; defaults to gcloud default project, and
+        ignored if connection_name is used.
+  --region=...
+        Google Cloud region (e.g. \`us-central1\`); defaults to gcloud default
+        region, and ignored if connection_name is used.
+  --proxy-command=cloud-sql-proxy
+        Path to the cloud-sql-proxy command.
+  --proxy-socket-dir=/tmp
+        Directory to store the proxy socket.
+  --proxy-timeout=3
+        Time in seconds to wait for cloud-sql-proxy to start.
+
+Examples:
+
+  - Connect to an instance in the default gcloud project with IAM auth:
+
+      cloud-sql-connect-iam my-instance
+
+  - Connect and execute SQL command (e.g. via Terraform):
+
+      cloud-sql-connect-iam my-instance -e 'SELECT "Hello world";'
+
+  - Connect using a full connection name with IAM auth:
+
+      cloud-sql-connect-iam my-project:us-west2:my-instance
+
+  - Connect with password-based auth and prompt for password on stdin:
+
+      cloud-sql-connect-iam my-instance --password
+
+  - Connect with password-based auth and send password via environment (not
+    recommended, but sometimes you have no choice):
+
+      MYSQL_PWD="somepass" cloud-sql-connect-iam my-instance --password
+
+  - Connect with password-based auth and send password via command-line
+    argument (definitely not recommended):
+
+      cloud-sql-connect-iam my-instance --password="somepass"
+
+  - Connect with service account impersonation:
+
+      (TODO: implement)
+EOF
+}
+
+function _log_debug() {
+  if [[ -n "${DEBUG}" ]]; then
+    printf "$@" >&2
+  fi
+}
+
+_parse_args() {
+  local pos=0
+  if (($# < 1)); then
+    _show_usage
+    return 1
+  fi
+  while (($#)); do
+    local arg="$1"
+    local value="${arg#*=}"
+    shift
+    case "${arg}" in
+      -h | --help)
+        _show_usage
+        return 1
+        ;;
+      --mysql-command=*)
+        MYSQL_COMMAND="${value}"
+        ;;
+      --password | --password=*)
+        _PASSWORD_LOGIN=1
+        _MYSQL_ARGS+=("${value}")
+        ;;
+      --project=*)
+        GCP_PROJECT="${value}"
+        ;;
+      --proxy-command=*)
+        PROXY_COMMAND="${value}"
+        ;;
+      --proxy-socket-dir=*)
+        PROXY_SOCKET_DIR="${value}"
+        ;;
+      --proxy-timeout=*)
+        PROXY_TIMEOUT="${value}"
+        ;;
+      --region=*)
+        GCP_REGION="${value}"
+        ;;
+      --)
+        _MYSQL_ARGS+=("$@")
+        break
+        ;;
+      *)
+        if ((pos == 0)); then
+          if [[ "${arg}" =~ : ]]; then
+            CONNECTION_NAME="${arg}"
+          else
+            INSTANCE_NAME="${arg}"
+          fi
+        else
+          _MYSQL_ARGS+=("${arg}")
+        fi
+        let ++pos
+        ;;
+    esac
+  done
+  # echo "${_MYSQL_ARGS[@]}"
+  # echo "${#_MYSQL_ARGS[@]}"
+
+  if ((pos == 0)); then
+    printf "Instance or connection name must be provided." >&2
+    return 1
+  fi
+}
+
+_infer_connection_name() {
+  #
+  # `_infer_connection_name <instance_name>`: Determines the connection name
+  # from an instance name and gcloud config or `--gcp-project`/`--gcp-region`
+  # arguments.
+  #
+  local instance_name="$1"
+
+  local gcp_project
+  if [[ -n "${GCP_PROJECT}" ]]; then
+    gcp_project="${GCP_PROJECT}"
+  else
+    gcp_project="$(gcloud config get-value project 2> /dev/null)" || return
+    if [[ -z "${gcp_project}" ]]; then
+      printf "GCP project must be provided if gcloud default project is unset.\n" >&2
+      return 1
+    fi
+  fi
+
+  local gcp_region
+  if [[ -n "${GCP_REGION}" ]]; then
+    gcp_region="${GCP_REGION}"
+  else
+    gcp_region="$(gcloud config get compute/region 2> /dev/null)" || return
+    if [[ -z "${gcp_region}" ]]; then
+      printf "GCP region must be provided if gcloud default region is unset.\n" >&2
+      return 1
+    fi
+  fi
+
+  echo "${gcp_project}:${gcp_region}:${instance_name}"
+}
+
+function _infer_gcloud_user() {
+  #
+  # `_infer_gcloud_user`: Infer the username based on the email of gcloud's
+  # application-default credentials.
+  #
+  # > **Note**: Although there's `gcloud config get account`, it comes from
+  # > `gcloud auth login` which is separate from `gcloud application-default
+  # > login`.  Although users often use the same account for both, this errs on
+  # > the side of consistently uses application-default credentials since that's
+  # > what cloud-sql-proxy defaults to as well.
+  #
+  # gcloud doesn't directly expose the application-default credentials email,
+  # but it can be retrieved via the `userinfo` API.
+  # See [stackoverflow#73368141](https://stackoverflow.com/questions/73368141).
+  #
+  _log_debug "Fetching gcloud application-default user info...\n"
+
+  local token user_info_json
+  token="$(gcloud auth application-default print-access-token)" || return
+  user_info_json="$(
+    curl \
+      https://www.googleapis.com/oauth2/v1/userinfo \
+      --header "Authorization: Bearer ${token}" \
+      --show-error \
+      --silent
+  )" || return
+
+  # Scrape JSON crudely to extract email (ymmv):
+  local email
+  if [[ "${user_info_json}" =~ \"email\":\ \"([^\"]+)\" ]]; then
+    email="${BASH_REMATCH[1]}"
+  else
+    echo "Unable to determine gcloud application-default email." >&2
+    return 1
+  fi
+
+  # Strip `@...` suffix - e.g. `first.last@gmail.com` -> `first.last`:
+  echo "${email%%@*}"
+}
+
+function _shutdown() {
+  local proxy_socket_subdir="$1"
+  local proxy_pid="$2"
+  if [[ -n "${proxy_pid}" ]]; then
+    _log_debug "Shutting down cloud-sql-proxy process %d\n" "${proxy_pid}"
+    kill "${proxy_pid}" 2> /dev/null
+    wait "${proxy_pid}"
+  fi
+  _log_debug "Removing proxy socket directory: %s\n" "${proxy_socket_subdir}"
+  rm -rf "${proxy_socket_subdir}"
+}
+
+function _bind_args() {
+  #
+  # `_bind_args <func> [args...]`: Generate a command string that binds
+  # argument(s) to a function with proper escaping (handling of spaces, etc.).
+  #
+  # This function closely resembles Python's `functions.partial`; but because
+  # it's not possible to return a function directly, the output is a command
+  # literal that can be evaluated via variable expansion without quotes (not
+  # requiring `eval)`.
+  #
+  # Example:
+  #
+  #     foo="$(_bind_args ls -l)"
+  #     ${foo}        # equivalent to `ls -l`
+  #     ${foo} -a ..  # equivalent to `ls -l -a ..`
+  #     "${foo}" -a   # incorrect! equivalent to `"ls -l" -a`
+  #
+  # > **Note**: This is one of the very few cases in bash where variable
+  # > expansion must *not* be quoted.
+  #
+  local func="$1"
+  printf "%q" "${func}"
+  shift
+  for arg in "$@"; do
+    printf " %q" "${arg}"
+  done
+}
+
+function _proxy_mysql() {
+  _parse_args "$@" || return
+
+  if [[ -z "${CONNECTION_NAME}" ]]; then
+    CONNECTION_NAME="$(_infer_connection_name "${INSTANCE_NAME}")" || return
+  fi
+
+  # Build proxy+mysql args:
+  local proxy_args=()
+  local mysql_args=()
+  proxy_args+=("${CONNECTION_NAME}")
+  if ((_PASSWORD_LOGIN == 0)); then
+    local user
+    user="$(_infer_gcloud_user)" || return
+    proxy_args+=("--auto-iam-authn")
+    mysql_args+=("--user=${user}")
+    export LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN=1
+  fi
+  mysql_args+=("${_MYSQL_ARGS[@]}")
+
+  # set -x
+
+  # Create tmpdir for proxy socket file:
+  local proxy_socket proxy_socket_subdir
+  proxy_socket_subdir="${PROXY_SOCKET_DIR}/$(mktemp -u cloudsql-XXXXXX)"
+  proxy_socket="${proxy_socket_subdir}/${CONNECTION_NAME}"
+  proxy_args+=("--unix-socket=${proxy_socket_subdir}")
+  mysql_args+=("--socket=${proxy_socket}")
+  umask 077
+  _log_debug "Proxy socket directory: %s\n" "${proxy_socket_subdir}"
+  mkdir -p "${proxy_socket_subdir}"
+  trap "$(_bind_args _shutdown "${proxy_socket_subdir}")" EXIT
+
+  # Start proxy:
+  "${PROXY_COMMAND}" "${proxy_args[@]}" &
+  local proxy_pid
+  proxy_pid="$!"
+  trap "$(_bind_args _shutdown "${proxy_socket_subdir}" "${proxy_pid}")" EXIT
+
+  # Wait for proxy to start:
+  SECONDS=0
+  until [[ -S "${proxy_socket}" ]]; do
+    if ((SECONDS >= ${PROXY_TIMEOUT})); then
+      printf "Timed out waiting for cloud-sql-proxy to start; exiting...\n" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  # Run mysql:
+  "${MYSQL_COMMAND}" "${mysql_args[@]}"
+}
+
+_proxy_mysql "$@"
