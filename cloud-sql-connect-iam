@@ -46,6 +46,7 @@ set -euo pipefail
 : ${PROXY_SOCKET_DIR:=/tmp}
 : ${PROXY_TIMEOUT:=3}
 _MYSQL_ARGS=()
+_MYSQL_USER=""
 _PASSWORD_LOGIN=0
 
 function _show_usage() {
@@ -116,6 +117,9 @@ Keyword arguments:
         Directory to store the proxy socket.
   --proxy-timeout=3
         Time in seconds to wait for cloud-sql-proxy to start.
+  --user=...
+        The user to connect as.  If unspecified, defaults to gcloud application-
+        default email, minus \`@*\` suffix.
 
 Examples:
 
@@ -177,7 +181,7 @@ _parse_args() {
         ;;
       --password | --password=*)
         _PASSWORD_LOGIN=1
-        _MYSQL_ARGS+=("${value}")
+        _MYSQL_ARGS+=("${arg}")
         ;;
       --project=*)
         GCP_PROJECT="${value}"
@@ -193,6 +197,10 @@ _parse_args() {
         ;;
       --region=*)
         GCP_REGION="${value}"
+        ;;
+      --user=*)
+        _MYSQL_USER="${value}"
+        _MYSQL_ARGS+=("${arg}")
         ;;
       --)
         _MYSQL_ARGS+=("$@")

@@ -67,6 +67,9 @@ Keyword arguments:
         Directory to store the proxy socket.
   --proxy-timeout=3
         Time in seconds to wait for cloud-sql-proxy to start.
+  --user=...
+        The user to connect as.  If unspecified, defaults to gcloud application-
+        default email, minus `@*` suffix.
 
 Examples:
 
