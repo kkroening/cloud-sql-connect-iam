@@ -40,14 +40,17 @@ set -euo pipefail
 : ${DEBUG:=}
 : ${GCP_PROJECT:=}
 : ${GCP_REGION:=}
+: ${IMPERSONATE_SERVICE_ACCOUN:=}
 : ${INSTANCE_NAME:=}
 : ${MYSQL_COMMAND:=mysql}
 : ${PROXY_COMMAND:=cloud-sql-proxy}
 : ${PROXY_SOCKET_DIR:=/tmp}
 : ${PROXY_TIMEOUT:=3}
+
 _MYSQL_ARGS=()
 _MYSQL_USER=""
-_PASSWORD_LOGIN=0
+_IAM_AUTH=1
+_PROXY_ARGS=()
 
 function _show_usage() {
   cat << EOF
@@ -101,7 +104,10 @@ Positional arguments:
 Keyword arguments:
   --help
         Show help.
-  --mysql-command=mysql 
+  --impersonate-service-account=...
+        Comma separated list of service accounts to impersonate. Last value
+        is the target account.
+  --mysql-command=mysql
         Path to the mysql command.
   --password[=...]
         Use password-based login instead of IAM auth.
@@ -151,7 +157,7 @@ Examples:
 
   - Connect with service account impersonation:
 
-      (TODO: implement)
+      cloud-sql-connect-iam my-instance --impersonate-service-account=svc@proj.iam.gserviceaccount.com
 EOF
 }
 
@@ -176,11 +182,15 @@ _parse_args() {
         _show_usage
         return 1
         ;;
+      --impersonate-service-account=*)
+        IMPERSONATE_SERVICE_ACCOUNT="${value}"
+        _PROXY_ARGS+=("${arg}")
+        ;;
       --mysql-command=*)
         MYSQL_COMMAND="${value}"
         ;;
       --password | --password=*)
-        _PASSWORD_LOGIN=1
+        _IAM_AUTH=0
         _MYSQL_ARGS+=("${arg}")
         ;;
       --project=*)
@@ -262,10 +272,10 @@ _infer_connection_name() {
   echo "${gcp_project}:${gcp_region}:${instance_name}"
 }
 
-function _infer_gcloud_user() {
+function _infer_gcloud_email() {
   #
-  # `_infer_gcloud_user`: Infer the username based on the email of gcloud's
-  # application-default credentials.
+  # `_infer_gcloud_email`: Infer the email of gcloud's application-default
+  # credentials.
   #
   # > **Note**: Although there's `gcloud config get account`, it comes from
   # > `gcloud auth login` which is separate from `gcloud application-default
@@ -298,8 +308,17 @@ function _infer_gcloud_user() {
     return 1
   fi
 
-  # Strip `@...` suffix - e.g. `first.last@gmail.com` -> `first.last`:
-  echo "${email%%@*}"
+  echo "${email}"
+}
+
+function _infer_user() {
+  local email
+  if [[ -n "${IMPERSONATE_SERVICE_ACCOUNT}" ]]; then
+    email="${IMPERSONATE_SERVICE_ACCOUNT##,}" # final comma-separated value
+  else
+    email="$(_infer_gcloud_email)" || return
+  fi
+  echo "${email%%@*}" # `first.last@example.com` -> `first.last`
 }
 
 function _shutdown() {
@@ -349,31 +368,30 @@ function _proxy_mysql() {
     CONNECTION_NAME="$(_infer_connection_name "${INSTANCE_NAME}")" || return
   fi
 
-  # Build proxy+mysql args:
-  local proxy_args=()
-  local mysql_args=()
-  proxy_args+=("${CONNECTION_NAME}")
-  if ((_PASSWORD_LOGIN == 0)); then
-    local user
-    user="$(_infer_gcloud_user)" || return
-    proxy_args+=("--auto-iam-authn")
-    mysql_args+=("--user=${user}")
-    export LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN=1
-  fi
-  mysql_args+=("${_MYSQL_ARGS[@]}")
-
-  # set -x
-
   # Create tmpdir for proxy socket file:
   local proxy_socket proxy_socket_subdir
   proxy_socket_subdir="${PROXY_SOCKET_DIR}/$(mktemp -u cloudsql-XXXXXX)"
   proxy_socket="${proxy_socket_subdir}/${CONNECTION_NAME}"
-  proxy_args+=("--unix-socket=${proxy_socket_subdir}")
-  mysql_args+=("--socket=${proxy_socket}")
   umask 077
   _log_debug "Proxy socket directory: %s\n" "${proxy_socket_subdir}"
   mkdir -p "${proxy_socket_subdir}"
   trap "$(_bind_args _shutdown "${proxy_socket_subdir}")" EXIT
+
+  # Build proxy+mysql args (user-supplied args taking precedence / last):
+  local proxy_args=("--unix-socket=${proxy_socket_subdir}" "${CONNECTION_NAME}")
+  local mysql_args=("--socket=${proxy_socket}")
+  if ((_IAM_AUTH == 1)); then
+    proxy_args+=("--auto-iam-authn")
+    export LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN=1
+    if [[ -z "${_MYSQL_USER}" ]]; then
+      mysql_args+=("--user=$(_infer_user)") || return
+    fi
+  fi
+  proxy_args+=("${_PROXY_ARGS[@]}")
+  mysql_args+=("${_MYSQL_ARGS[@]}")
+
+  echo "${proxy_args[@]}"
+  echo "${mysql_args[@]}"
 
   # Start proxy:
   "${PROXY_COMMAND}" "${proxy_args[@]}" &
