@@ -40,7 +40,7 @@ set -euo pipefail
 : ${DEBUG:=}
 : ${GCP_PROJECT:=}
 : ${GCP_REGION:=}
-: ${IMPERSONATE_SERVICE_ACCOUN:=}
+: ${IMPERSONATE_SERVICE_ACCOUNT:=}
 : ${INSTANCE_NAME:=}
 : ${MYSQL_COMMAND:=mysql}
 : ${PROXY_COMMAND:=cloud-sql-proxy}
@@ -326,8 +326,8 @@ function _shutdown() {
   local proxy_pid="$2"
   if [[ -n "${proxy_pid}" ]]; then
     _log_debug "Shutting down cloud-sql-proxy process %d\n" "${proxy_pid}"
-    kill "${proxy_pid}" 2> /dev/null
-    wait "${proxy_pid}"
+    kill "${proxy_pid}" 2> /dev/null || true
+    wait "${proxy_pid}" || true
   fi
   _log_debug "Removing proxy socket directory: %s\n" "${proxy_socket_subdir}"
   rm -rf "${proxy_socket_subdir}"
@@ -390,11 +390,11 @@ function _proxy_mysql() {
   proxy_args+=("${_PROXY_ARGS[@]}")
   mysql_args+=("${_MYSQL_ARGS[@]}")
 
-  echo "${proxy_args[@]}"
-  echo "${mysql_args[@]}"
+  echo "${proxy_args[@]}" >&2
+  echo "${mysql_args[@]}" >&2
 
   # Start proxy:
-  "${PROXY_COMMAND}" "${proxy_args[@]}" &
+  "${PROXY_COMMAND}" "${proxy_args[@]}" >&2 &
   local proxy_pid
   proxy_pid="$!"
   trap "$(_bind_args _shutdown "${proxy_socket_subdir}" "${proxy_pid}")" EXIT
@@ -410,7 +410,7 @@ function _proxy_mysql() {
   done
 
   # Run mysql:
-  "${MYSQL_COMMAND}" "${mysql_args[@]}"
+  "${MYSQL_COMMAND}" "${mysql_args[@]}" || return
 }
 
 _proxy_mysql "$@"
