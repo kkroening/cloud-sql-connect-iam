@@ -2,7 +2,7 @@
 #
 # `cloud-sql-connect-iam`: Connect to Google Cloud SQL securely with IAM auth.
 #
-# See `_show_usage` for detailed usage explanation.
+# See `csql_ciam::_show_usage` for detailed usage explanation.
 #
 # Code style mostly follows [Google's Shell Style Guide]
 # (https://google.github.io/styleguide/shellguide.html) with some minor
@@ -36,54 +36,81 @@
 #
 set -euo pipefail
 
-: ${CONNECTION_NAME:=}
-: ${DEBUG:=}
-: ${GCP_PROJECT:=}
-: ${GCP_REGION:=}
-: ${IMPERSONATE_SERVICE_ACCOUNT:=}
-: ${INSTANCE_NAME:=}
-: ${MYSQL_COMMAND:=mysql}
-: ${PROXY_COMMAND:=cloud-sql-proxy}
-: ${PROXY_SOCKET_DIR:=/tmp}
-: ${PROXY_TIMEOUT:=3}
+: ${CSQL_CIAM_SUBCOMMAND:=mysql}
+: ${CSQL_CIAM_CONNECTION_NAME:=}
+: ${CSQL_CIAM_DEBUG:=}
+: ${CSQL_CIAM_GCP_PROJECT:=}
+: ${CSQL_CIAM_GCP_REGION:=}
+: ${CSQL_CIAM_IAM_AUTH:=1}
+: ${CSQL_CIAM_IMPERSONATE_SERVICE_ACCOUNT:=}
+: ${CSQL_CIAM_INSTANCE_NAME:=}
+: ${CSQL_CIAM_PROXY_COMMAND:=cloud-sql-proxy}
+: ${CSQL_CIAM_PROXY_TIMEOUT:=3}
+: ${CSQL_CIAM_PROXY_TMPDIR:=/tmp}
 
-_MYSQL_ARGS=()
-_MYSQL_USER=""
-_IAM_AUTH=1
-_PROXY_ARGS=()
+_CSQL_CIAM_SUBCOMMAND_ARGS=()
+_CSQL_CIAM_PROXY_ARGS=()
 
-function _show_usage() {
+csql_ciam::_show_usage() {
+  local prog_name="$(basename "$0")"
   cat << EOF
-$(basename "$0"): Connect to Google Cloud SQL securely with IAM auth.
+${prog_name}: Connect to Google Cloud SQL securely with IAM auth.
 
 Usage:
-  $(basename "$0") <instance_name|connection_name> [--] [mysql_arguments...]
+  ${prog_name} <instance_name|connection_name> [--] [subcmd...]
 
 Description:
   Connects to a Cloud SQL database instance over cloud-sql-proxy using a unix
-  domain socket, with suppport for IAM-based authentication
-
-  Only MySQL is currently supported.
+  domain socket and IAM-based authentication (optional).
 
   This tool addresses some of the limitations of the official \`gcloud sql
   connect\`: IAM authentication, unix-domain sockets, and accepting additional
-  \`mysql\` command arguments.  The primary focus is to simplify automation of
+  sub-command arguments.  The primary focus is to simplify automation of
   Cloud SQL provisioning for deployment from GitHub Actions with Terraform and
   workload identity federation, but it can also be used from a system
   administration standpoint to quickly, conveniently, and securely connect to a
   Cloud SQL instance without requiring use of shared secrets (username/
   password), and instead leveraging Google Cloud's IAM.
 
+  Conceptually, this tools effectively acts like a Python async context manager
+  that runs cloud-sql-proxy over a unix-domain socket in the background, runs a
+  subcommand with a predictable environment, and then shuts down the proxy:
+
+    # Pseudo code:
+    async with cloud_sql_connect_iam.Context(...) as env:
+        assert 'CSQL_CIAM_USER' in env
+        assert 'MYSQL_HOST' in env
+        # etc.
+
+  The subcommand runs with several environment variables exported:
+
+  *   \`CSQL_CIAM_CONNECTION_NAME\`
+  *   \`CSQL_CIAM_GCP_PROJECT\`
+  *   \`CSQL_CIAM_GCP_REGION\`
+  *   \`CSQL_CIAM_IAM_AUTH\`
+  *   \`CSQL_CIAM_IMPERSONATE_SERVICE_ACCOUNT\`
+  *   \`CSQL_CIAM_INSTANCE_NAME\`
+  *   \`CSQL_CIAM_PROXY_TMPDIR\`
+  *   \`CSQL_CIAM_USER\`
+  *   \`LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN\`
+  *   \`MYSQL_TEST_LOGIN_FILE\`
+  *   \`MYSQL_UNIX_PORT\`
+
+  Although the default subcommand is \`mysql\`, only user-supplied arguments are
+  passed to the subcommand, with additional information being exported via the
+  environment for subcommands to use as desired.
+
+IAM authentication:
   Use of Cloud SQL IAM authentication requires care from a security standpoint
   because cloud-sql-proxy and gcloud-sql-connect use TCP sockets by default,
   which creates a local port that provides direct SQL access with only a
   username - i.e. unacceptable.  Instead, unix-domain sockets are far more
   secure because they can be locked down with 0700 file system permissions.
-  Unfortunately, gcloud-sql-connect doesn't support unix-domain sockets (yet?),
-  and cloud-sql-proxy requires painstaking management of temp directories to
-  avoid collision with concurrently running proxies.  This tool eliminates the
-  hassle by automatically running the proxy in the background with a unique
-  tmpdir, and cleaning up upon exiting.
+  Unfortunately, gcloud-sql-connect doesn't support unix-domain sockets
+  (yet?), and cloud-sql-proxy requires painstaking management of temp
+  directories to avoid collision with concurrently running proxies.  This tool
+  eliminates the hassle by automatically running the proxy in the background
+  with a unique tmpdir, and cleaning up upon exiting.
 
   IAM authentication is not strictly required; although it's ideal in many
   cases, there are certain cases where you can't avoid the need for password-
@@ -107,8 +134,6 @@ Keyword arguments:
   --impersonate-service-account=...
         Comma separated list of service accounts to impersonate. Last value
         is the target account.
-  --mysql-command=mysql
-        Path to the mysql command.
   --password[=...]
         Use password-based login instead of IAM auth.
   --project=...
@@ -119,7 +144,7 @@ Keyword arguments:
         region, and ignored if connection_name is used.
   --proxy-command=cloud-sql-proxy
         Path to the cloud-sql-proxy command.
-  --proxy-socket-dir=/tmp
+  --proxy-tmpdir=/tmp
         Directory to store the proxy socket.
   --proxy-timeout=3
         Time in seconds to wait for cloud-sql-proxy to start.
@@ -146,7 +171,7 @@ Examples:
       cloud-sql-connect-iam my-instance --password
 
   - Connect with password-based auth and send password via environment (not
-    recommended, but sometimes you have no choice):
+    recommended, but sometimes you have no choice - e.g. Terraform local-exec):
 
       MYSQL_PWD="somepass" cloud-sql-connect-iam my-instance --password
 
@@ -161,121 +186,52 @@ Examples:
 EOF
 }
 
-function _log_debug() {
-  if [[ -n "${DEBUG}" ]]; then
+csql_ciam::_log_debug() {
+  if [[ -n "${CSQL_CIAM_DEBUG}" ]]; then
     printf "$@" >&2
   fi
 }
 
-_parse_args() {
-  local pos=0
-  if (($# < 1)); then
-    _show_usage
-    return 1
-  fi
-  while (($#)); do
-    local arg="$1"
-    local value="${arg#*=}"
-    shift
-    case "${arg}" in
-      -h | --help)
-        _show_usage
-        return 1
-        ;;
-      --impersonate-service-account=*)
-        IMPERSONATE_SERVICE_ACCOUNT="${value}"
-        _PROXY_ARGS+=("${arg}")
-        ;;
-      --mysql-command=*)
-        MYSQL_COMMAND="${value}"
-        ;;
-      --password | --password=*)
-        _IAM_AUTH=0
-        _MYSQL_ARGS+=("${arg}")
-        ;;
-      --project=*)
-        GCP_PROJECT="${value}"
-        ;;
-      --proxy-command=*)
-        PROXY_COMMAND="${value}"
-        ;;
-      --proxy-socket-dir=*)
-        PROXY_SOCKET_DIR="${value}"
-        ;;
-      --proxy-timeout=*)
-        PROXY_TIMEOUT="${value}"
-        ;;
-      --region=*)
-        GCP_REGION="${value}"
-        ;;
-      --user=*)
-        _MYSQL_USER="${value}"
-        _MYSQL_ARGS+=("${arg}")
-        ;;
-      --)
-        _MYSQL_ARGS+=("$@")
-        break
-        ;;
-      *)
-        if ((pos == 0)); then
-          if [[ "${arg}" =~ : ]]; then
-            CONNECTION_NAME="${arg}"
-          else
-            INSTANCE_NAME="${arg}"
-          fi
-        else
-          _MYSQL_ARGS+=("${arg}")
-        fi
-        let ++pos
-        ;;
-    esac
-  done
-  # echo "${_MYSQL_ARGS[@]}"
-  # echo "${#_MYSQL_ARGS[@]}"
-
-  if ((pos == 0)); then
-    printf "Instance or connection name must be provided." >&2
-    return 1
-  fi
-}
-
-_infer_connection_name() {
+csql_ciam::_infer_connection_name() {
   #
-  # `_infer_connection_name <instance_name>`: Determines the connection name
-  # from an instance name and gcloud config or `--gcp-project`/`--gcp-region`
-  # arguments.
+  # Usage:
+  #   csql_ciam::_infer_connection_name \
+  #     <gcp_project?> \
+  #     <gcp_region?> \
+  #     <instance_name>
   #
-  local instance_name="$1"
+  # Determines the connection name from an instance name and gcloud config or
+  # `--gcp-project`/`--gcp-region` arguments.
+  #
+  local gcp_project="$1"
+  local gcp_region="$2"
+  local instance_name="$3"
 
-  local gcp_project
-  if [[ -n "${GCP_PROJECT}" ]]; then
-    gcp_project="${GCP_PROJECT}"
-  else
+  if [[ -z "${gcp_project}" ]]; then
     gcp_project="$(gcloud config get-value project 2> /dev/null)" || return
     if [[ -z "${gcp_project}" ]]; then
       printf "GCP project must be provided if gcloud default project is unset.\n" >&2
       return 1
     fi
+    CSQL_CIAM_GCP_PROJECT="${gcp_project}" # TODO: move somewhere better
   fi
 
-  local gcp_region
-  if [[ -n "${GCP_REGION}" ]]; then
-    gcp_region="${GCP_REGION}"
-  else
+  if [[ -z "${gcp_region}" ]]; then
     gcp_region="$(gcloud config get compute/region 2> /dev/null)" || return
     if [[ -z "${gcp_region}" ]]; then
       printf "GCP region must be provided if gcloud default region is unset.\n" >&2
       return 1
     fi
+    CSQL_CIAM_GCP_REGION="${gcp_region}" # TODO: move somewhere better
   fi
 
   echo "${gcp_project}:${gcp_region}:${instance_name}"
 }
 
-function _infer_gcloud_email() {
+csql_ciam::_infer_gcloud_email() {
   #
-  # `_infer_gcloud_email`: Infer the email of gcloud's application-default
-  # credentials.
+  # `csql_ciam_infer_gcloud_email`: Infer the email of gcloud's application-
+  # default credentials.
   #
   # > **Note**: Although there's `gcloud config get account`, it comes from
   # > `gcloud auth login` which is separate from `gcloud application-default
@@ -287,7 +243,7 @@ function _infer_gcloud_email() {
   # but it can be retrieved via the `userinfo` API.
   # See [stackoverflow#73368141](https://stackoverflow.com/questions/73368141).
   #
-  _log_debug "Fetching gcloud application-default user info...\n"
+  csql_ciam::_log_debug "Fetching gcloud application-default user info...\n"
 
   local token user_info_json
   token="$(gcloud auth application-default print-access-token)" || return
@@ -311,32 +267,144 @@ function _infer_gcloud_email() {
   echo "${email}"
 }
 
-function _infer_user() {
+csql_ciam::_infer_user() {
+  local impersonate_service_account="$1"
   local email
-  if [[ -n "${IMPERSONATE_SERVICE_ACCOUNT}" ]]; then
-    email="${IMPERSONATE_SERVICE_ACCOUNT##,}" # final comma-separated value
+  if [[ -n "${impersonate_service_account}" ]]; then
+    email="${impersonate_service_account##,}" # final comma-separated value
   else
-    email="$(_infer_gcloud_email)" || return
+    email="$(csql_ciam::_infer_gcloud_email)" || return
   fi
   echo "${email%%@*}" # `first.last@example.com` -> `first.last`
 }
 
-function _shutdown() {
-  local proxy_socket_subdir="$1"
-  local proxy_pid="$2"
+csql_ciam::_parse_args() {
+  #
+  # Parses command-line args and fills in `CSQL_CIAM_*` variables if not already
+  # passed in via environment.
+  #
+  # Some are tricky to infer and involve more than pure arg parsing, such as
+  # `CSQL_CIAM_USER`; but by the end of this function, all `CSQL_CIAM_*` should
+  # be defined and assumed to be subsequently immutable.
+  #
+
+  local arg_pos=0
+  if (($# < 1)); then
+    csql_ciam::_show_usage
+    return 1
+  fi
+  while (($#)); do
+    local arg="$1"
+    local value="${arg#*=}"
+    shift
+    case "${arg}" in
+      --command=*)
+        CSQL_CIAM_SUBCOMMAND="${value}"
+        ;;
+      -h | --help)
+        csql_ciam::_show_usage
+        return 1
+        ;;
+      --impersonate-service-account=*)
+        CSQL_CIAM_IMPERSONATE_SERVICE_ACCOUNT="${value}"
+        _PROXY_ARGS+=("${arg}")
+        ;;
+      --no-iam)
+        CSQL_CIAM_IAM_AUTH=0
+        ;;
+      -p | --password | --password=*)
+        CSQL_CIAM_IAM_AUTH=0
+        _CSQL_CIAM_SUBCOMMAND_ARGS+=("${arg}")
+        ;;
+      --project=*)
+        CSQL_CIAM_GCP_PROJECT="${value}"
+        ;;
+      --proxy-command=*)
+        CSQL_CIAM_PROXY_COMMAND="${value}"
+        ;;
+      --proxy-tmpdir=*)
+        CSQL_CIAM_PROXY_TMPDIR="${value}"
+        ;;
+      --proxy-timeout=*)
+        CSQL_CIAM_PROXY_TIMEOUT="${value}"
+        ;;
+      --region=*)
+        CSQL_CIAM_GCP_REGION="${value}"
+        ;;
+      --user=*)
+        CSQL_CIAM_USER="${value}"
+        _CSQL_CIAM_SUBCOMMAND_ARGS+=("${arg}")
+        ;;
+      --)
+        _CSQL_CIAM_SUBCOMMAND_ARGS+=("$@")
+        break
+        ;;
+      *)
+        if ((arg_pos == 0)); then
+          if [[ "${arg}" =~ : ]]; then
+            CSQL_CIAM_CONNECTION_NAME="${arg}"
+          else
+            CSQL_CIAM_INSTANCE_NAME="${arg}"
+          fi
+        elif ((arg_pos == 1)); then
+          CSQL_CIAM_SUBCOMMAND="${arg}"
+        else
+          _CSQL_CIAM_SUBCOMMAND_ARGS+=("${arg}")
+        fi
+        let ++arg_pos
+        ;;
+    esac
+  done
+
+  if [[ -z "${CSQL_CIAM_CONNECTION_NAME}" ]]; then
+    if [[ -z "${CSQL_CIAM_INSTANCE_NAME:-}" ]]; then
+      printf "Instance or connection name must be provided." >&2
+      return 1
+    fi
+    CSQL_CIAM_CONNECTION_NAME="$(
+      csql_ciam::_infer_connection_name \
+        "${CSQL_CIAM_GCP_PROJECT}" \
+        "${CSQL_CIAM_GCP_REGION}" \
+        "${CSQL_CIAM_INSTANCE_NAME}"
+    )" || return
+  else
+    # TODO: unpack CSQL_CIAM_CONNECTION_NAME and set CSQL_CIAM_GCP_PROJECT +
+    # CSQL_CIAM_GCP_REGION
+    :
+  fi
+  if [[ -z "${CSQL_CIAM_USER:-}" ]] && ((CSQL_CIAM_IAM_AUTH == 1)); then
+    CSQL_CIAM_USER="$(
+      csql_ciam::_infer_user "${CSQL_CIAM_IMPERSONATE_SERVICE_ACCOUNT}"
+    )" || return
+  fi
+
+  # echo "${CSQL_CIAM_SUBCOMMAND}"
+  # echo "${CSQL_CIAM_COMMAND_ARGS[@]}"
+}
+
+csql_ciam::_shutdown() {
+  local proxy_tmp_subdir="$1"
+  local proxy_pid="${2:-}"
+
   if [[ -n "${proxy_pid}" ]]; then
-    _log_debug "Shutting down cloud-sql-proxy process %d\n" "${proxy_pid}"
+    csql_ciam::_log_debug \
+      "Shutting down cloud-sql-proxy process %d\n" \
+      "${proxy_pid}"
     kill "${proxy_pid}" 2> /dev/null || true
     wait "${proxy_pid}" || true
   fi
-  _log_debug "Removing proxy socket directory: %s\n" "${proxy_socket_subdir}"
-  rm -rf "${proxy_socket_subdir}"
+
+  csql_ciam::_log_debug \
+    "Removing proxy socket tmp directory: %s\n" \
+    "${proxy_tmp_subdir}"
+  rm -rf "${proxy_tmp_subdir}"
 }
 
-function _bind_args() {
+csql_ciam::_bind_args() {
   #
-  # `_bind_args <func> [args...]`: Generate a command string that binds
-  # argument(s) to a function with proper escaping (handling of spaces, etc.).
+  # `csql_ciam::_bind_args <func> [args...]`: Generate a command string that
+  # binds argument(s) to a function with proper escaping (handling of spaces,
+  # etc.).
   #
   # This function closely resembles Python's `functions.partial`; but because
   # it's not possible to return a function directly, the output is a command
@@ -345,7 +413,7 @@ function _bind_args() {
   #
   # Example:
   #
-  #     foo="$(_bind_args ls -l)"
+  #     foo="$(csql_ciam::_bind_args ls -l)"
   #     ${foo}        # equivalent to `ls -l`
   #     ${foo} -a ..  # equivalent to `ls -l -a ..`
   #     "${foo}" -a   # incorrect! equivalent to `"ls -l" -a`
@@ -361,56 +429,111 @@ function _bind_args() {
   done
 }
 
-function _proxy_mysql() {
-  _parse_args "$@" || return
+csql_ciam::_run_subcommand() {
+  #
+  # Runs the subcommand specified by the caller (e.g. `mysql`).
+  #
+  # No explicit assumption is made about the particular subcommand here, and
+  # care is taken not to wreck the user-supplied subcommand arguments; therefore
+  # anything MySQL-specific is passed through environment variables, and the
+  # subcommand can choose to use them or not.
+  #
+  # Oddly, for MySQL username is the most obnoxious part to pass throug the
+  # environment because AFAICT it can only be done via an "option file" - e.g.
+  # via MYSQL_TEST_LOGIN_FILE - *or* as a command-line arg; so this goes with
+  # the option file approach to avoid mangling the subcommand args.
+  #
 
-  if [[ -z "${CONNECTION_NAME}" ]]; then
-    CONNECTION_NAME="$(_infer_connection_name "${INSTANCE_NAME}")" || return
+  # Export `CSQL_*` variables:
+  export CSQL_CIAM_USER
+  export CSQL_CIAM_CONNECTION_NAME
+  export CSQL_CIAM_GCP_PROJECT
+  export CSQL_CIAM_GCP_REGION
+  export CSQL_CIAM_IAM_AUTH
+  export CSQL_CIAM_IMPERSONATE_SERVICE_ACCOUNT
+  export CSQL_CIAM_INSTANCE_NAME
+  export CSQL_CIAM_PROXY_TMPDIR
+
+  if ((CSQL_CIAM_DEBUG == 1)); then
+    set | grep '^CSQL_' 2>&1
   fi
+
+  # Export mysql environment variables (in case the subcommand is mysql):
+  if ((CSQL_CIAM_IAM_AUTH == 1)); then
+    export LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN=1
+  fi
+  if [[ -n "${CSQL_CIAM_USER}" ]]; then
+    # FIXME: mysql claims to accept a username by providing
+    # MYSQL_TEST_LOGIN_FILE but it doesn't seem to work (at least with IAM
+    # auth). Temporary hack is to just jam `--user=...` onto the command line,
+    # but definitely don't want to for non-mysql commands.  This goes against
+    # the description above and isn't foolproof.  TODO: fix later.
+    if [[ "${CSQL_CIAM_SUBCOMMAND}" == "mysql" ]]; then
+      _CSQL_CIAM_SUBCOMMAND_ARGS+=("--user=${CSQL_CIAM_USER}")
+    fi
+
+    # export MYSQL_TEST_LOGIN_FILE="${proxy_tmp_subdir}/mylogin.cnf"
+    # local mysql_config=$'[client]\n'"user = ${CSQL_CIAM_USER}"$'\n'
+    # echo "${mysql_config}" > "${MYSQL_TEST_LOGIN_FILE}"
+  fi
+  export MYSQL_UNIX_PORT="${proxy_socket}"
+
+  # Run subcommand:
+  "${CSQL_CIAM_SUBCOMMAND}" "${_CSQL_CIAM_SUBCOMMAND_ARGS[@]}" || return
+}
+
+csql_ciam::_main() {
+  csql_ciam::_parse_args "$@" || return
 
   # Create tmpdir for proxy socket file:
-  local proxy_socket proxy_socket_subdir
-  proxy_socket_subdir="${PROXY_SOCKET_DIR}/$(mktemp -u cloudsql-XXXXXX)"
-  proxy_socket="${proxy_socket_subdir}/${CONNECTION_NAME}"
   umask 077
-  _log_debug "Proxy socket directory: %s\n" "${proxy_socket_subdir}"
-  mkdir -p "${proxy_socket_subdir}"
-  trap "$(_bind_args _shutdown "${proxy_socket_subdir}")" EXIT
+  local proxy_socket proxy_tmp_subdir
+  proxy_tmp_subdir="${CSQL_CIAM_PROXY_TMPDIR}/$(mktemp -u cloudsql-XXXXXX)"
+  proxy_socket="${proxy_tmp_subdir}/${CSQL_CIAM_CONNECTION_NAME}"
+  csql_ciam::_log_debug "Proxy socket directory: %s\n" "${proxy_tmp_subdir}"
+  mkdir -p "${proxy_tmp_subdir}"
+  trap "$(csql_ciam::_bind_args csql_ciam::_shutdown "${proxy_tmp_subdir}")" EXIT
 
-  # Build proxy+mysql args (user-supplied args taking precedence / last):
-  local proxy_args=("--unix-socket=${proxy_socket_subdir}" "${CONNECTION_NAME}")
-  local mysql_args=("--socket=${proxy_socket}")
-  if ((_IAM_AUTH == 1)); then
+  # Build proxy args:
+  local proxy_args=(
+    "--unix-socket=${proxy_tmp_subdir}"
+    "${CSQL_CIAM_CONNECTION_NAME}"
+    "${_PROXY_ARGS[@]}"
+  )
+  if ((CSQL_CIAM_IAM_AUTH == 1)); then
     proxy_args+=("--auto-iam-authn")
-    export LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN=1
-    if [[ -z "${_MYSQL_USER}" ]]; then
-      mysql_args+=("--user=$(_infer_user)") || return
-    fi
   fi
-  proxy_args+=("${_PROXY_ARGS[@]}")
-  mysql_args+=("${_MYSQL_ARGS[@]}")
 
-  echo "${proxy_args[@]}" >&2
-  echo "${mysql_args[@]}" >&2
+  # echo "${proxy_args[@]}" >&2
 
   # Start proxy:
-  "${PROXY_COMMAND}" "${proxy_args[@]}" >&2 &
+  csql_ciam::_log_debug \
+    "Starting proxy: %s %s\n" "${CSQL_CIAM_PROXY_COMMAND}" "${proxy_args[*]}"
+
+  "${CSQL_CIAM_PROXY_COMMAND}" "${proxy_args[@]}" >&2 &
   local proxy_pid
   proxy_pid="$!"
-  trap "$(_bind_args _shutdown "${proxy_socket_subdir}" "${proxy_pid}")" EXIT
+  trap \
+    "$(
+      csql_ciam::_bind_args \
+        csql_ciam::_shutdown \
+        "${proxy_tmp_subdir}" \
+        "${proxy_pid}"
+    )" \
+    EXIT
 
   # Wait for proxy to start:
   SECONDS=0
   until [[ -S "${proxy_socket}" ]]; do
-    if ((SECONDS >= ${PROXY_TIMEOUT})); then
+    if ((SECONDS >= ${CSQL_CIAM_PROXY_TIMEOUT})); then
       printf "Timed out waiting for cloud-sql-proxy to start; exiting...\n" >&2
       return 1
     fi
     sleep 0.1
   done
 
-  # Run mysql:
-  "${MYSQL_COMMAND}" "${mysql_args[@]}" || return
+  # Run subcommand at last:
+  csql_ciam::_run_subcommand
 }
 
-_proxy_mysql "$@"
+csql_ciam::_main "$@"
