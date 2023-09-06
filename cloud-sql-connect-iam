@@ -48,6 +48,7 @@ set -euo pipefail
 : ${CSQL_CIAM_PROXY_COMMAND:=cloud-sql-proxy}
 : ${CSQL_CIAM_PROXY_TIMEOUT:=3}
 : ${CSQL_CIAM_PROXY_TMPDIR:=/tmp}
+: ${CSQL_CIAM_QUIET:=1}
 
 _CSQL_CIAM_PROXY_ARGS=()
 _CSQL_CIAM_SUBCOMMAND_ARGS=()
@@ -236,6 +237,9 @@ csql_ciam::_parse_args() {
         ;;
       --proxy-timeout=*)
         CSQL_CIAM_PROXY_TIMEOUT="${value}"
+        ;;
+      --quiet)
+        CSQL_CIAM_QUIET=1
         ;;
       --region=*)
         CSQL_CIAM_GCP_REGION="${value}"
@@ -466,6 +470,9 @@ csql_ciam::_main() {
   )
   if ((CSQL_CIAM_IAM_AUTH == 1)); then
     proxy_args+=("--auto-iam-authn")
+  fi
+  if ((CSQL_CIAM_QUIET == 1)); then
+    proxy_args+=("--quiet")
   fi
 
   # echo "${proxy_args[@]}" >&2
