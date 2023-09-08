@@ -48,7 +48,7 @@ set -euo pipefail
 : ${CSQL_CIAM_PROXY_COMMAND:=cloud-sql-proxy}
 : ${CSQL_CIAM_PROXY_TIMEOUT:=3}
 : ${CSQL_CIAM_PROXY_TMPDIR:=/tmp}
-: ${CSQL_CIAM_QUIET:=1}
+: ${CSQL_CIAM_QUIET:=0}
 
 _CSQL_CIAM_PROXY_ARGS=()
 _CSQL_CIAM_SUBCOMMAND_ARGS=()
@@ -59,7 +59,7 @@ csql_ciam::_show_usage() {
 ${prog_name}: Connect to Google Cloud SQL securely with IAM auth.
 
 Usage:
-  ${prog_name} <instance_name|connection_name> [--] [subcmd...]
+  ${prog_name} <instance_name|connection_name> [ -- [subcmd...]]
 
 Description:
   Connects to a Cloud SQL database instance over cloud-sql-proxy using a unix
@@ -121,10 +121,10 @@ IAM authentication:
 Positional arguments:
   <instance_name|connection_name>
         The name of the Google Cloud SQL instance or full connection name.
-  [--]
-        If specified, pass all subsequent arguments directly to MySQL.
-  [mysql_arguments...]
-        Any additional arguments passed directly to the MySQL client.
+  [-- [subcmd...]]
+        If specified, \`--\` demarcates the following arguments as being the
+        sub-command to run within the scope of cloud-sql-proxy running in the
+        background.  If unspecified, the sub-command defaults to \`mysql\`.
 
 Keyword arguments:
   --help
